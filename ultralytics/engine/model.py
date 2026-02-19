@@ -27,6 +27,21 @@ from ultralytics.utils import (
 
 
 class Model(torch.nn.Module):
+
+    def add_persistent_track(self, id):
+        """Add a persistent track ID for BoT-SORT tracker."""
+        from ultralytics.trackers.bot_sort import BOTSORT
+        BOTSORT.add_persistent_track(id)
+
+    def remove_persistent_track(self, id):
+        """Remove a persistent track ID for BoT-SORT tracker."""
+        from ultralytics.trackers.bot_sort import BOTSORT
+        BOTSORT.remove_persistent_track(id)
+
+    def is_persistent(self, id):
+        """Check if a track ID is persistent for BoT-SORT tracker."""
+        from ultralytics.trackers.bot_sort import BOTSORT
+        return BOTSORT.is_persistent(id)
     """A base class for implementing YOLO models, unifying APIs across different model types.
 
     This class provides a common interface for various operations related to YOLO models, such as training, validation,

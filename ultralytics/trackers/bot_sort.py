@@ -3,6 +3,22 @@
 from __future__ import annotations
 
 from collections import deque
+
+# Persistent ID registry for BOTSORT
+class PersistentIDRegistry:
+    persistent_ids = set()
+
+    @classmethod
+    def add_persistent_track(cls, id):
+        cls.persistent_ids.add(id)
+
+    @classmethod
+    def remove_persistent_track(cls, id):
+        cls.persistent_ids.discard(id)
+
+    @classmethod
+    def is_persistent(cls, id):
+        return id in cls.persistent_ids
 from typing import Any
 
 import numpy as np
@@ -145,6 +161,10 @@ class BOTrack(STrack):
 
 
 class BOTSORT(BYTETracker):
+    # Persistent ID API
+    add_persistent_track = PersistentIDRegistry.add_persistent_track
+    remove_persistent_track = PersistentIDRegistry.remove_persistent_track
+    is_persistent = PersistentIDRegistry.is_persistent
     """An extended version of the BYTETracker class for YOLO, designed for object tracking with ReID and GMC algorithm.
 
     Attributes:
@@ -231,6 +251,10 @@ class BOTSORT(BYTETracker):
         """Reset the BOTSORT tracker to its initial state, clearing all tracked objects and internal states."""
         super().reset()
         self.gmc.reset_params()
+
+    def _should_remove_track(self, track_id):
+        # Only remove if not persistent
+        return not self.is_persistent(track_id)
 
 
 class ReID:
