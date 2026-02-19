@@ -31,7 +31,13 @@ class Model(torch.nn.Module):
     def add_persistent_track(self, id):
         """Add a persistent track ID for BoT-SORT tracker."""
         from ultralytics.trackers.bot_sort import BOTSORT
-        BOTSORT.add_persistent_track(id)
+        # Grab live tracker if available
+        tracker = None
+        if self.predictor is not None and hasattr(self.predictor, "trackers"):
+            trackers = self.predictor.trackers
+            if trackers:
+                tracker = trackers[0]  # or iterate if multi-cam
+        BOTSORT.add_persistent_track(id, tracker=tracker)
 
     def remove_persistent_track(self, id):
         """Remove a persistent track ID for BoT-SORT tracker."""
