@@ -3,34 +3,6 @@
 from __future__ import annotations
 from ultralytics.utils import LOGGER
 from collections import deque
-
-# Persistent ID registry for BOTSORT
-class PersistentIDRegistry:
-    persistent_info = {}
-
-    @classmethod
-    def add_persistent_track(cls, id, tracker=None):
-        id = int(id)
-        if id not in cls.persistent_info:
-            cls.persistent_info[id] = {"cls": None, "embedding": None}
-        # If tracker is provided, try to capture info immediately
-        if tracker is not None:
-            tracked = getattr(tracker, 'tracked_stracks', [])
-            for track in tracked:
-                tid = getattr(track, 'track_id', None)
-                if tid == id:
-                    cls_id = getattr(track, 'cls', None)
-                    embedding = getattr(track, 'smooth_feat', None)
-                    cls.persistent_info[id] = {"cls": cls_id, "embedding": embedding}
-                    break
-
-    @classmethod
-    def remove_persistent_track(cls, id):
-        cls.persistent_info.pop(int(id), None)
-
-    @classmethod
-    def is_persistent(cls, id):
-        return int(id) in cls.persistent_info
 from typing import Any
 
 import numpy as np
@@ -173,12 +145,6 @@ class BOTrack(STrack):
 
 
 class BOTSORT(BYTETracker):
-    # Persistent ID API
-    @staticmethod
-    def add_persistent_track(id, tracker=None):
-        PersistentIDRegistry.add_persistent_track(id, tracker=tracker)
-    remove_persistent_track = PersistentIDRegistry.remove_persistent_track
-    is_persistent = PersistentIDRegistry.is_persistent
     """An extended version of the BYTETracker class for YOLO, designed for object tracking with ReID and GMC algorithm.
 
     Attributes:
@@ -214,6 +180,7 @@ class BOTSORT(BYTETracker):
         """
         super().__init__(args, frame_rate)
         self.gmc = GMC(method=args.gmc_method)
+        self.persistent_info = {}
 
         # ReID module
         self.proximity_thresh = args.proximity_thresh
@@ -225,6 +192,26 @@ class BOTSORT(BYTETracker):
             if args.with_reid
             else None
         )
+
+    def add_persistent_track(self, id):
+        """Add a persistent track ID."""
+        id = int(id)
+        if id not in self.persistent_info:
+            self.persistent_info[id] = {"cls": None, "embedding": None}
+        # Try to capture info immediately if the track is currently active
+        for track in self.tracked_stracks:
+            if track.track_id == id:
+                self.persistent_info[id]["cls"] = track.cls
+                self.persistent_info[id]["embedding"] = track.smooth_feat.copy() if track.smooth_feat is not None else None
+                break
+
+    def remove_persistent_track(self, id):
+        """Remove a persistent track ID."""
+        self.persistent_info.pop(int(id), None)
+
+    def is_persistent(self, id):
+        """Check if a track ID is persistent."""
+        return int(id) in self.persistent_info
 
     def get_kalmanfilter(self) -> KalmanFilterXYWH:
         """Return an instance of KalmanFilterXYWH for predicting and updating object states in the tracking process."""
@@ -255,6 +242,14 @@ class BOTSORT(BYTETracker):
             emb_dists[emb_dists > (1 - self.appearance_thresh)] = 1.0
             emb_dists[dists_mask] = 1.0
             dists = np.minimum(dists, emb_dists)
+
+        # Force infinite distance for class mismatches to categorically prevent cross-class matching
+        if len(tracks) > 0 and len(detections) > 0:
+            track_classes = np.array([t.cls for t in tracks])
+            det_classes = np.array([d.cls for d in detections])
+            class_mask = track_classes[:, None] != det_classes[None, :]
+            dists[class_mask] = np.inf
+
         return dists
 
     def multi_predict(self, tracks: list[BOTrack]) -> None:
@@ -271,15 +266,14 @@ class BOTSORT(BYTETracker):
         for track in self.lost_stracks:
             tid = int(track.track_id)
             if self.is_persistent(tid):
-                registry_cls = PersistentIDRegistry.persistent_info[tid]["cls"]
-                LOGGER.info(f"[SNAPSHOT] id={tid} track.cls={track.cls} registry_cls={registry_cls} feat_available={track.smooth_feat is not None}")
+                registry_cls = self.persistent_info[tid]["cls"]
                 if track.smooth_feat is not None:
                     # Only snapshot embedding if class matches — prevents corrupting
                     # the embedding when BOT-SORT reassigns this ID to a different object
                     if registry_cls is None or int(track.cls) == int(registry_cls):
-                        PersistentIDRegistry.persistent_info[tid]["embedding"] = track.smooth_feat.copy()
+                        self.persistent_info[tid]["embedding"] = track.smooth_feat.copy()
                     if registry_cls is None:
-                        PersistentIDRegistry.persistent_info[tid]["cls"] = track.cls
+                        self.persistent_info[tid]["cls"] = track.cls
 
         # --- Run normal BOT-SORT Rounds 1 and 2 ---
         output = super().update(results, img, feats)
@@ -289,94 +283,81 @@ class BOTSORT(BYTETracker):
         # track (activated) or discarded. We need to intercept the new tracks that were just
         # activated this frame and check if they should instead be re-assigned a persistent ID.
         # These are tracks with tracklet_len == 0 and is_activated == True added this frame.
-        if not PersistentIDRegistry.persistent_info or not self.args.with_reid:
+        if not self.persistent_info or not self.args.with_reid:
             return output
 
         # Collect candidates: registry entries that have a valid embedding
+        # Crucially, exclude any persistent ID that's ALREADY actively being tracked this frame
+        active_pids = {int(t.track_id) for t in self.tracked_stracks if t.is_activated}
         persistent_ids = [
-            pid for pid, info in PersistentIDRegistry.persistent_info.items()
-            if info["embedding"] is not None
+            pid for pid, info in self.persistent_info.items()
+            if info["embedding"] is not None and pid not in active_pids
         ]
         if not persistent_ids:
             return output
 
-        # Find newly activated tracks this frame (just born, tracklet_len == 0)
-        # These are the detections that didn't match any existing track
-        new_tracks = [t for t in self.tracked_stracks if t.is_activated and t.tracklet_len == 0]
+        # Find newly activated tracks this frame (just born, tracklet_len == 0, state Tracked)
+        # These are the detections that didn't match any existing track, avoiding refind_stracks.
+        new_tracks = [t for t in self.tracked_stracks if t.is_activated and t.tracklet_len == 0 and t.state == TrackState.Tracked]
         if not new_tracks:
             return output
 
         # Build registry embedding matrix: shape (num_persistent, feat_dim)
         registry_embeddings = np.array(
-            [PersistentIDRegistry.persistent_info[pid]["embedding"] for pid in persistent_ids],
+            [self.persistent_info[pid]["embedding"] for pid in persistent_ids],
             dtype=np.float32,
         )
-        registry_classes = [PersistentIDRegistry.persistent_info[pid]["cls"] for pid in persistent_ids]
+        registry_classes = [self.persistent_info[pid]["cls"] for pid in persistent_ids]
 
-        # Track which persistent IDs have already been claimed this frame
-        # so that only one detection can be re-assigned per persistent ID
-        claimed_pids = set()
-
-        for new_track in new_tracks:
+        # Build full cost matrix: rows = new_tracks, cols = persistent_ids
+        # Default cost is 1.0 (no match). Only fill in where classes match and feat is available.
+        cost_matrix = np.ones((len(new_tracks), len(persistent_ids)), dtype=np.float32)
+        for i, new_track in enumerate(new_tracks):
             if new_track.curr_feat is None:
                 continue
+            det_feat = new_track.curr_feat.reshape(1, -1).astype(np.float32)
+            for j, pid in enumerate(persistent_ids):
+                if registry_classes[j] is None:
+                    continue
+                if int(registry_classes[j]) != int(new_track.cls):
+                    continue
+                reg_feat = registry_embeddings[j].reshape(1, -1)
+                cost_matrix[i, j] = cdist(det_feat, reg_feat, metric="cosine")[0][0]
 
-            det_feat = new_track.curr_feat.reshape(1, -1).astype(np.float32)  # (1, feat_dim)
+        # Solve optimal assignment — reuses the same lap-based solver as Rounds 1 and 2
+        matches, _, _ = matching.linear_assignment(cost_matrix, thresh=1 - self.appearance_thresh)
 
-            # Filter candidates by class
-            class_mask = [
-                i for i, pid in enumerate(persistent_ids)
-                if registry_classes[i] is not None and int(registry_classes[i]) == int(new_track.cls)
-            ]
-            if not class_mask:
-                continue
-
-            candidate_ids = [persistent_ids[i] for i in class_mask]
-            candidate_embeddings = registry_embeddings[class_mask]  # (num_candidates, feat_dim)
-
-            # Cosine distance: shape (1, num_candidates)
-            dists = cdist(det_feat, candidate_embeddings, metric="cosine")[0]  # (num_candidates,)
-
-            best_idx = int(np.argmin(dists))
-            best_dist = dists[best_idx]
-            best_pid = candidate_ids[best_idx]
-
-            # Check against appearance threshold (convert similarity thresh to distance: 1 - thresh)
-            if best_dist > (1 - self.appearance_thresh):
-                continue
-
-            # Skip if this persistent ID was already claimed by a better match this frame
-            if best_pid in claimed_pids:
-                continue
-
-            claimed_pids.add(best_pid)
-
-            LOGGER.info(f"[ROUND3] new_track id={new_track.track_id} cls={int(new_track.cls)} "
-            f"best_pid={best_pid} registry_cls={PersistentIDRegistry.persistent_info[best_pid]['cls']} "
-            f"dist={best_dist:.3f} thresh={1 - self.appearance_thresh:.3f} WILL_MATCH={best_dist <= (1 - self.appearance_thresh)}")
+        for i, j in matches:
+            new_track = new_tracks[i]
+            best_pid = persistent_ids[j]
+            best_dist = cost_matrix[i, j]
 
             # Re-assign this new track the persistent ID
-            # We forcibly set track_id to the persistent ID — no new ID counter increment
             new_track.track_id = best_pid
             # Ensure the global counter never re-issues this persistent ID to a future new track
             if best_pid >= BaseTrack._count:
                 BaseTrack._count = best_pid + 1
-            # Update the registry embedding with the fresh detection feature
-            PersistentIDRegistry.persistent_info[best_pid]["embedding"] = new_track.smooth_feat.copy()
-            # Never overwrite cls — it was set at registration and must stay as ground truth
-            if PersistentIDRegistry.persistent_info[best_pid]["cls"] is None:
-                PersistentIDRegistry.persistent_info[best_pid]["cls"] = new_track.cls
+            # Update registry embedding with fresh detection feature
+            self.persistent_info[best_pid]["embedding"] = new_track.smooth_feat.copy()
+            # Never overwrite cls — locked at registration time
+            if self.persistent_info[best_pid]["cls"] is None:
+                self.persistent_info[best_pid]["cls"] = new_track.cls
 
-        return output
+        # --- Step 3: Rebuild output array ---
+        # Since we modified the track_ids of some newly tracked items, 
+        # the original output returned by super().update() is stale.
+        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
 
     def reset(self) -> None:
         """Reset the BOTSORT tracker to its initial state, clearing all tracked objects and internal states."""
         super().reset()
         self.gmc.reset_params()
 
-    def _should_remove_track(self, track_id):
-        # Only remove if not persistent
-        return not self.is_persistent(track_id)
+    def _should_remove_track(self, track: STrack) -> bool:
+        """Never remove persistent tracks from memory."""
+        if self.is_persistent(track.track_id):
+            return False
+        return super()._should_remove_track(track)
 
 
 class ReID:

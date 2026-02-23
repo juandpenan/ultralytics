@@ -30,24 +30,24 @@ class Model(torch.nn.Module):
 
     def add_persistent_track(self, id):
         """Add a persistent track ID for BoT-SORT tracker."""
-        from ultralytics.trackers.bot_sort import BOTSORT
+        self._persistent_ids.add(int(id))
         # Grab live tracker if available
-        tracker = None
-        if self.predictor is not None and hasattr(self.predictor, "trackers"):
-            trackers = self.predictor.trackers
-            if trackers:
-                tracker = trackers[0]  # or iterate if multi-cam
-        BOTSORT.add_persistent_track(id, tracker=tracker)
+        if getattr(self, "predictor", None) is not None and hasattr(self.predictor, "trackers"):
+            for tracker in self.predictor.trackers:
+                if hasattr(tracker, "add_persistent_track"):
+                    tracker.add_persistent_track(id)
 
     def remove_persistent_track(self, id):
         """Remove a persistent track ID for BoT-SORT tracker."""
-        from ultralytics.trackers.bot_sort import BOTSORT
-        BOTSORT.remove_persistent_track(id)
+        self._persistent_ids.discard(int(id))
+        if getattr(self, "predictor", None) is not None and hasattr(self.predictor, "trackers"):
+            for tracker in self.predictor.trackers:
+                if hasattr(tracker, "remove_persistent_track"):
+                    tracker.remove_persistent_track(id)
 
     def is_persistent(self, id):
-        """Check if a track ID is persistent for BoT-SORT tracker."""
-        from ultralytics.trackers.bot_sort import BOTSORT
-        return BOTSORT.is_persistent(id)
+        """Check if a track ID is persistent."""
+        return int(id) in getattr(self, "_persistent_ids", set())
     """A base class for implementing YOLO models, unifying APIs across different model types.
 
     This class provides a common interface for various operations related to YOLO models, such as training, validation,
@@ -130,6 +130,7 @@ class Model(torch.nn.Module):
         self.predictor = None  # reuse predictor
         self.model = None  # model object
         self.trainer = None  # trainer object
+        self._persistent_ids = set()  # Queue for persistent tracking IDs
         self.ckpt = {}  # if loaded from *.pt
         self.cfg = None  # if loaded from *.yaml
         self.ckpt_path = None
@@ -594,6 +595,15 @@ class Model(torch.nn.Module):
             from ultralytics.trackers import register_tracker
 
             register_tracker(self, persist)
+
+            def propagate_persistent_ids(predictor):
+                if hasattr(predictor, "trackers"):
+                    for t in predictor.trackers:
+                        if hasattr(t, "add_persistent_track"):
+                            for pid in getattr(self, "_persistent_ids", set()):
+                                t.add_persistent_track(pid)
+
+            self.add_callback("on_predict_start", propagate_persistent_ids)
         kwargs["conf"] = kwargs.get("conf") or 0.1  # ByteTrack-based method needs low confidence predictions as input
         kwargs["batch"] = kwargs.get("batch") or 1  # batch-size 1 for tracking in videos
         kwargs["mode"] = "track"

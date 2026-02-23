@@ -376,7 +376,7 @@ class BYTETracker:
             activated_stracks.append(track)
         # Step 5: Update state
         for track in self.lost_stracks:
-            if self.frame_id - track.end_frame > self.max_time_lost:
+            if self._should_remove_track(track):
                 track.mark_removed()
                 removed_stracks.append(track)
 
@@ -392,6 +392,10 @@ class BYTETracker:
             self.removed_stracks = self.removed_stracks[-1000:]  # clip removed stracks to 1000 maximum
 
         return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+
+    def _should_remove_track(self, track: STrack) -> bool:
+        """Determine if a lost track should be removed based on how long it has been lost."""
+        return self.frame_id - track.end_frame > self.max_time_lost
 
     def get_kalmanfilter(self) -> KalmanFilterXYAH:
         """Return a Kalman filter object for tracking bounding boxes using KalmanFilterXYAH."""
